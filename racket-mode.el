@@ -662,6 +662,12 @@ doesn't hurt to do so."
 (require 'easymenu)
 (require 'hideshow)
 
+(defun racket-run-gui ()
+  "Save and evaluate the buffer in REPL, like DrRacket's Run."
+  (interactive)
+  (save-buffer)
+  (racket--eval (format ",run/gui \"%s\"\n" (buffer-file-name))))
+
 (defun racket-run ()
   "Save and evaluate the buffer in REPL, like DrRacket's Run."
   (interactive)

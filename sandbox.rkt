@@ -26,15 +26,30 @@
          syntax/srcloc
          "defn.rkt")
 
-(define (run-file path-str)
+(define (run-file run-new)
   (display (banner))
-  (let loop ([path-str path-str])
-    (define next (do-run path-str))
+  (let loop ([run-new run-new])
+    (define next 
+      (cond [(not run-new)
+             (do-run #f)]
+            [else
+             (define runner (run-new-sandbox-runner run-new))
+             (define path-str (run-new-sandbox-path run-new))
+             (runner path-str)]))
     (unless (eq? next 'exit)
       (newline)
       (loop next))))
 
-(struct run-new-sandbox (path)) ;(or/c #f path-string?)
+;;(or/c #f path-string?) Boolean
+(struct run-new-sandbox (path runner))
+;; (-> any) continuation
+(struct call-in-top (effect k))
+
+;; do-run/gui :: (maybe/c path-string?) -> (maybe/c path-string? 'exit)
+;; like do-run, but calls initialize-gui first
+(define (do-run/gui path-str)
+  (initialize-gui)
+  (do-run path-str))
 
 ;; do-run :: (or/c #f path-string?) -> (or/c #f path-string? 'exit)
 ;;
@@ -65,15 +80,27 @@
                     [error-display-handler our-error-display-handler])
        (match (make-eval path)
          [(and x (or #f 'exit)) x]
-         [e (parameterize ([current-eval e])
+         [e 
+          ;; some things (like initialize-gui) need to be run outside of our sandbox
+          ;; To do this we raise an exception to get out of the sandbox
+          ;; cause the desired effect in the top environment
+          ;; then use a continuation to jump back into the sandbox. gross, eh?
+          (with-handlers ([call-in-top?
+                           (λ (r)
+                             ((call-in-top-effect r))
+                             ((call-in-top-k r) #f))])
+            (parameterize ([current-eval e])
               (with-handlers
                   ([exn:fail:sandbox-terminated? (lambda (exn)
                                                    (display-exn exn)
                                                    'exit)]
                    [run-new-sandbox? (lambda (b)
                                        (kill-evaluator (current-eval))
-                                       (run-new-sandbox-path b))])
-                (our-read-eval-print-loop)))])))))
+                                       b)])
+                (our-read-eval-print-loop))))])))))
+
+(define (initialize-gui) 
+  (dynamic-require 'racket/gui/base 0))
 
 ;; path-string? -> (values path? path?)
 (define (path-string->path&load-dir path-str)
@@ -133,7 +160,11 @@
           [(uq cmd)
            (eq? 'unquote (syntax-e #'uq))
            (case (syntax-e #'cmd)
-             [(run) (raise (run-new-sandbox (~a (read))))]
+             [(run) (raise (run-new-sandbox (~a (read)) do-run))]
+             [(run/gui) (raise (run-new-sandbox (~a (read)) do-run/gui))]
+             [(init-gui) 
+              (let/cc k (raise (call-in-top initialize-gui k)))
+              (void)]
              [(top) (raise (run-new-sandbox #f))]
              [(def) (def (read))]
              [(doc) (doc (read-line))]
