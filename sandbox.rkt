@@ -26,30 +26,17 @@
          syntax/srcloc
          "defn.rkt")
 
-(define (run-file run-new)
+(define (run-file path-str)
   (display (banner))
-  (let loop ([run-new run-new])
-    (define next 
-      (cond [(not run-new)
-             (do-run #f)]
-            [else
-             (define runner (run-new-sandbox-runner run-new))
-             (define path-str (run-new-sandbox-path run-new))
-             (runner path-str)]))
+  (let loop ([path-str path-str])
+    (define next (do-run path-str))
     (unless (eq? next 'exit)
       (newline)
       (loop next))))
 
-;;(or/c #f path-string?) Boolean
-(struct run-new-sandbox (path runner))
+(struct run-new-sandbox (path));(or/c #f path-string?)
 ;; (-> any) continuation
 (struct call-in-top (effect k))
-
-;; do-run/gui :: (maybe/c path-string?) -> (maybe/c path-string? 'exit)
-;; like do-run, but calls initialize-gui first
-(define (do-run/gui path-str)
-  (initialize-gui)
-  (do-run path-str))
 
 ;; do-run :: (or/c #f path-string?) -> (or/c #f path-string? 'exit)
 ;;
@@ -90,13 +77,13 @@
                              ((call-in-top-effect r))
                              ((call-in-top-k r) #f))])
             (parameterize ([current-eval e])
-              (with-handlers
+              (with-handlers*
                   ([exn:fail:sandbox-terminated? (lambda (exn)
                                                    (display-exn exn)
                                                    'exit)]
                    [run-new-sandbox? (lambda (b)
                                        (kill-evaluator (current-eval))
-                                       b)])
+                                       (run-new-sandbox-path b))])
                 (our-read-eval-print-loop))))])))))
 
 (define (initialize-gui) 
@@ -160,11 +147,11 @@
           [(uq cmd)
            (eq? 'unquote (syntax-e #'uq))
            (case (syntax-e #'cmd)
-             [(run) (raise (run-new-sandbox (~a (read)) do-run))]
-             [(run/gui) (raise (run-new-sandbox (~a (read)) do-run/gui))]
-             [(init-gui) 
-              (let/cc k (raise (call-in-top initialize-gui k)))
-              (void)]
+             [(run) (raise (run-new-sandbox (~a (read))))]
+             [(run/gui) 
+              (initialize-gui-for-sandbox)
+              (raise (run-new-sandbox (~a (read))))]
+             [(init-gui) (initialize-gui-for-sandbox)]
              [(top) (raise (run-new-sandbox #f))]
              [(def) (def (read))]
              [(doc) (doc (read-line))]
@@ -176,6 +163,14 @@
              [(cd) (cd (~a (read)))]
              [else stx])]
           [_ stx])))))
+
+;; when called from within the sandbox will initialze gui for ALL future sandboxes
+;; failure to call this before using racket/base/gui will cause all future attempts
+;; to use racket/base/gui to fail
+;; don't call outside of a sandbox
+(define (initialize-gui-for-sandbox)
+  (let/cc k (raise (call-in-top initialize-gui k)))
+  (void))
 
 ;; This is almost exactly like Racket's read-eval-print-loop except it
 ;; does NOT cons #%top-interaction to the read form. Because the
@@ -402,3 +397,33 @@
 
 (module+ main
   (run-file #f))
+
+
+
+
+;; tests for gui mode and evaling outside of sandbox
+(module+ test
+  (define-syntax-rule (test-repl/error (form result ...) ...)
+    (let-values ([(current-in o) (make-pipe)]
+                 [(i current-o) (make-pipe)]
+                 [(_ /dev/null) (make-pipe)])
+      (define (next)
+        (define x (read-line i))
+        (displayln x)
+        x)
+      (define t (parameterize ([current-input-port current-in]
+                               [current-error-port current-o]
+                               [current-output-port /dev/null])
+                  (thread (λ () (run-file #f)))))
+      (displayln form o) ...
+      (begin
+        (let ([x (next)])
+          (displayln `(testing ,result ,x))
+          (check-regexp-match result x)) ...) ...
+          (kill-thread t)))
+  ;; these tests are really bad. They exist more for debugging than for testing...
+  (test-repl/error
+   (",run/gui \"/tmp/x.rkt\"" #rx"(?!(.*cannot instantiate `racket/gui/base'.*))")
+   (",run/gui \"/tmp/x.rkt\"" #rx"(?!(.*cannot instantiate `racket/gui/base'.*))"))
+  (test-repl/error
+   (",run/gui \"/tmp/x.rkt\"" #rx"^(?!(; require: unknown module)).*$")))
