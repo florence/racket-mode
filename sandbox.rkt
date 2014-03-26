@@ -35,8 +35,10 @@
       (loop next))))
 
 (struct run-new-sandbox (path));(or/c #f path-string?)
-;; (-> any) continuation
-(struct call-in-top (effect k))
+(struct init-gui (k)); continuation
+
+
+(define SANDBOX-ESCAPE (make-continuation-prompt-tag 'escape))
 
 ;; do-run :: (or/c #f path-string?) -> (or/c #f path-string? 'exit)
 ;;
@@ -49,42 +51,56 @@
   (define-values (path load-dir) (path-string->path&load-dir path-str))
   (call-with-trusted-sandbox-configuration
    (lambda ()
-     ;; Need to set some parameters so they're in effect _before_
-     ;; creating the sandboxed evaluator. Note that using
-     ;; `call-with-trusted-sandbox-configuration` above sets a number
-     ;; of parameters to be permissive (e.g. `sandbox-memory-limit`,
-     ;; `sandbox-eval-limits`, and `sandbox-security-guard`) so we
-     ;; don't need to set them here.
-     (parameterize ([current-namespace (make-empty-namespace)]
-                    [sandbox-input (current-input-port)]
-                    [sandbox-output (current-output-port)]
-                    [sandbox-error-output (current-error-port)]
-                    [sandbox-propagate-exceptions #f]
-                    [compile-enforce-module-constants #f]
-                    [compile-context-preservation-enabled #t]
-                    [current-load-relative-directory load-dir]
-                    [current-prompt-read (make-prompt-read path)]
-                    [error-display-handler our-error-display-handler])
-       (match (make-eval path)
-         [(and x (or #f 'exit)) x]
-         [e 
-          ;; some things (like initialize-gui) need to be run outside of our sandbox
-          ;; To do this we raise an exception to get out of the sandbox
-          ;; cause the desired effect in the top environment
-          ;; then use a continuation to jump back into the sandbox. gross, eh?
-          (with-handlers ([call-in-top?
-                           (λ (r)
-                             ((call-in-top-effect r))
-                             ((call-in-top-k r) #f))])
-            (parameterize ([current-eval e])
-              (with-handlers*
-                  ([exn:fail:sandbox-terminated? (lambda (exn)
-                                                   (display-exn exn)
-                                                   'exit)]
-                   [run-new-sandbox? (lambda (b)
-                                       (kill-evaluator (current-eval))
-                                       (run-new-sandbox-path b))])
-                (our-read-eval-print-loop))))])))))
+     ;; initialize-gui needs to be run outside of our sandbox
+     ;; To do this we raise an exception to get out of the sandbox
+     ;; cause the desired effect in the top environment
+     ;; then use a continuation to jump back into the sandbox. gross, eh?
+     (call-with-continuation-prompt
+      (lambda ()
+        (with-handlers ([init-gui?
+                         (λ (r)
+                           (displayln 'top)
+                           (initialize-gui)
+                           ((init-gui-k r) #f))])
+          
+          ;; Need to set some parameters so they're in effect _before_
+          ;; creating the sandboxed evaluator. Note that using
+          ;; `call-with-trusted-sandbox-configuration` above sets a number
+          ;; of parameters to be permissive (e.g. `sandbox-memory-limit`,
+          ;; `sandbox-eval-limits`, and `sandbox-security-guard`) so we
+          ;; don't need to set them here.
+          (define root (current-namespace))
+          (parameterize ([current-namespace (make-empty-namespace)]
+                         [sandbox-input (current-input-port)]
+                         [sandbox-output (current-output-port)]
+                         [sandbox-error-output (current-error-port)]
+                         [sandbox-propagate-exceptions #f]
+                         [compile-enforce-module-constants #f]
+                         [compile-context-preservation-enabled #t]
+                         [current-load-relative-directory load-dir]
+                         [current-prompt-read (make-prompt-read path)]
+                         [error-display-handler our-error-display-handler])
+            (match (make-eval path)
+              [(and x (or #f 'exit)) x]
+              [e 
+               (parameterize ([current-eval e])
+                 (with-handlers
+                     ([exn:fail:sandbox-terminated? (lambda (exn)
+                                                      (display-exn exn)
+                                                      'exit)]
+                      [run-new-sandbox? (lambda (b)
+                                          (kill-evaluator (current-eval))
+                                          (run-new-sandbox-path b))]
+                      ;; After initializing gui in the top we need to attach it to the 
+                      ;; sanbox namespace.
+                      [init-gui? (lambda (b)
+                                   (call/cc (lambda (k) (raise (init-gui k)) SANDBOX-ESCAPE))
+                                   (namespace-attach-module root 'racket/gui/base)
+                                   (namespace-require 'racket/gui/base)
+                                   ((init-gui-k b) #f))])
+                   (our-read-eval-print-loop)))]))))
+      ;; the prompt tag
+      SANDBOX-ESCAPE))))
 
 (define (initialize-gui) 
   (dynamic-require 'racket/gui/base 0))
@@ -169,7 +185,7 @@
 ;; to use racket/base/gui to fail
 ;; don't call outside of a sandbox
 (define (initialize-gui-for-sandbox)
-  (let/cc k (raise (call-in-top initialize-gui k)))
+  (call/cc (lambda (k) (raise (init-gui k))) SANDBOX-ESCAPE)
   (void))
 
 ;; This is almost exactly like Racket's read-eval-print-loop except it
@@ -397,33 +413,3 @@
 
 (module+ main
   (run-file #f))
-
-
-
-
-;; tests for gui mode and evaling outside of sandbox
-(module+ test
-  (define-syntax-rule (test-repl/error (form result ...) ...)
-    (let-values ([(current-in o) (make-pipe)]
-                 [(i current-o) (make-pipe)]
-                 [(_ /dev/null) (make-pipe)])
-      (define (next)
-        (define x (read-line i))
-        (displayln x)
-        x)
-      (define t (parameterize ([current-input-port current-in]
-                               [current-error-port current-o]
-                               [current-output-port /dev/null])
-                  (thread (λ () (run-file #f)))))
-      (displayln form o) ...
-      (begin
-        (let ([x (next)])
-          (displayln `(testing ,result ,x))
-          (check-regexp-match result x)) ...) ...
-          (kill-thread t)))
-  ;; these tests are really bad. They exist more for debugging than for testing...
-  (test-repl/error
-   (",run/gui \"/tmp/x.rkt\"" #rx"(?!(.*cannot instantiate `racket/gui/base'.*))")
-   (",run/gui \"/tmp/x.rkt\"" #rx"(?!(.*cannot instantiate `racket/gui/base'.*))"))
-  (test-repl/error
-   (",run/gui \"/tmp/x.rkt\"" #rx"^(?!(; require: unknown module)).*$")))
